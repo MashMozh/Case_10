@@ -1,0 +1,56 @@
+def smart_piggy_bank(csv_file: str = "money.csv", json_file: str = None):
+    print("=" * 70)
+    print("💰 УМНАЯ КОПИЛКА — личный финансовый помощник 💡")
+    print("=" * 70)
+
+    # === 1. Импорт данных ===
+    transactions = []
+    if csv_file:
+        transactions += import_financial_data(csv_file)
+    if json_file:
+        transactions += import_financial_data(json_file)
+
+    if not transactions:
+        print("❌ Нет данных для анализа.")
+        return
+
+    # === 2. Классификация ===
+    categorized = categorize_all_transactions(transactions)
+
+    # === 3. Аналитика ===
+    stats = calculate_basic_stats(categorized)
+    category_stats = calculate_by_category(categorized)
+    timeline = analyze_by_time(categorized)
+
+    # === 4. Планирование бюджета ===
+    analysis = analyze_historical_spending(categorized)
+    budget = create_budget_template(analysis, stats["total_income"])
+    comparison = compare_budget_vs_actual(budget, categorized)
+
+    # === 5. Отчет ===
+    print("\n=== ФИНАНСОВЫЙ ОТЧЕТ ===")
+    print(f"💰 Доходы: {stats['total_income']:.2f} руб.")
+    print(f"💸 Расходы: {abs(stats['total_expense']):.2f} руб.")
+    print(f"⚖️ Баланс: {stats['balance']:.2f} руб.")
+
+    print("\n📊 Расходы по категориям:")
+    for cat, data in category_stats.items():
+        print(f"  {cat}: {abs(data['sum']):.2f} руб. ({data['percent']:.1f}%)")
+
+    print("\n📅 Анализ по месяцам:")
+    for month, data in timeline.items():
+        print(f"  {month}: Доход {data['income']:.2f} | Расход {abs(data['expenses']):.2f}")
+        if data["top_categories"]:
+            top = ", ".join([f"{c} ({n})" for c, n in data["top_categories"]])
+            print(f"   🔸 Топ категории: {top}")
+
+    print("\n🎯 РЕКОМЕНДАЦИИ ПО БЮДЖЕТУ:")
+    print("Топ категорий по расходам:")
+    for cat, val in analysis["top_categories"]:
+        print(f"  🔸 {cat}: {val:.2f} руб. в среднем")
+
+    print("\n📋 СРАВНЕНИЕ С БЮДЖЕТОМ:")
+    for cat, info in comparison.items():
+        print(f"  {cat}: Потрачено {info['actual']:.2f} / Лимит {info['limit']:.2f} → {info['status']}")
+
+    print("\n✅ Работа завершена успешно!\n")
