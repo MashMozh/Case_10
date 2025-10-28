@@ -1,0 +1,762 @@
+"""
+Расширенный модуль — Роль 4 (Планирование бюджета, расширения + визуализация)
+- Симулятор финансовых решений
+- Система финансовых целей
+- Персонализированные рекомендации
+- Оптимизатор распределения бюджета (50/30/20 с учетом приоритетов)
+- Визуализации: прогресс целей, эффект сценариев, базовые диаграммы расходов
+Примечание: многие функции сделаны упрощённо и легко поддаются доработке под реальные данные.
+"""
+
+import math
+from collections import defaultdict, Counter
+from statistics import mean, stdev
+from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+import copy
+
+
+# ---------------------------
+# Вспомогательные "умные" процессы (простейшие реализации)
+# ---------------------------
+
+def smart_description_parser(transactions: list) -> list:
+    """
+    Простейший нормализатор описаний: приводит к нижнему регистру,
+    убирает лишние пробелы и заменяет сокращения.
+    """
+    for t in transactions:
+        desc = str(t.get("description", "")).strip().lower()
+        # простые замены (пример)
+        desc = desc.replace("пятерочке", "пятерочка").replace("ресторан суши", "суши")
+        t["description_norm"] = desc
+    return transactions
+
+
+def detect_and_convert_currency(transactions: list, target_currency: str = "RUB") -> list:
+    """
+    Заглушка: в реале реализовать парсер валют и курсы.
+    Здесь предполагаем, что все суммы уже в целевой валюте — просто помечаем.
+    """
+    for t in transactions:
+        t.setdefault("currency", target_currency)
+    return transactions
+
+
+def find_duplicate_transactions(transactions: list, window_days: int = 1) -> list:
+    """
+    Находит возможные дубликаты: одинаковая сумма и описание в окне +/- window_days.
+    Возвращает список пар индексов/идентификаторов дубликатов.
+    """
+    duplicates = []
+    indexed = list(enumerate(transactions))
+    for i, t in indexed:
+        for j, s in indexed[i+1:]:
+            if abs(t["amount"] - s["amount"]) < 1e-6 and t.get("description_norm") == s.get("description_norm"):
+                # проверим близость по дате
+                try:
+                    di = datetime.strptime(t["date"], "%Y-%m-%d")
+                    dj = datetime.strptime(s["date"], "%Y-%m-%d")
+                    if abs((di - dj).days) <= window_days:
+                        duplicates.append((i, j))
+                except Exception:
+                    pass
+    return duplicates
+
+
+def add_tags_to_transactions(transactions: list, tags_map: dict = None) -> list:
+    """
+    Добавляет теги к транзакциям по ключевым словам.
+    tags_map: { "food": ["пицца","ресторан"], ... }
+    """
+    if tags_map is None:
+        tags_map = {
+            "food": ["пятерочка", "магнит", "суши", "кафе", "ресторан", "еда", "доставка"],
+            "transport": ["метро", "такси", "автобус", "бензин"],
+            "subscription": ["подписка", "netflix", "spotify"],
+            "electronics": ["мвидео", "электронный мир", "dns", "ситилинк"],
+        }
+    for t in transactions:
+        desc = t.get("description_norm", t.get("description", "")).lower()
+        tags = set()
+        for tag, keywords in tags_map.items():
+            for kw in keywords:
+                if kw in desc:
+                    tags.add(tag)
+                    break
+        t["tags"] = list(tags) if tags else []
+    return transactions
+
+
+def identify_recurring_payments(transactions: list, min_occurrences: int = 3) -> list:
+    """
+    Попытка найти регулярные платежи: группируем по нормализованному описанию
+    и смотрим, сколько раз встречается в разные месяцы.
+    Возвращаем список найденных recurring: [{"description": ..., "avg_amount":..., "frequency":"monthly"}]
+    """
+    groups = defaultdict(list)
+    for t in transactions:
+        key = t.get("description_norm", t.get("description", "")).strip()
+        groups[key].append(t)
+
+    recurring = []
+    for desc, items in groups.items():
+        if len(items) < min_occurrences:
+            continue
+        # проверяем месячную регулярность — уникальные месяцы
+        months = set()
+        amounts = []
+        for it in items:
+            try:
+                months.add(datetime.strptime(it["date"], "%Y-%m-%d").strftime("%Y-%m"))
+            except Exception:
+                pass
+            amounts.append(abs(it["amount"]) if it["amount"] < 0 else 0)
+        if len(months) >= min_occurrences:
+            recurring.append({
+                "description": desc,
+                "count": len(items),
+                "unique_months": len(months),
+                "avg_amount": round(mean(amounts), 2),
+                "frequency": "monthly"
+            })
+    return recurring
+
+
+# ---------------------------
+# Аналитические функции и "здоровье"
+# ---------------------------
+
+def calculate_basic_stats(transactions: list) -> dict:
+    """
+    Основные показатели: доход, расход, баланс, кол-во транзакций.
+    Возвращает также totals_by_category (по имеющимся категориям).
+    """
+    total_income = 0.0
+    total_expenses = 0.0
+    totals_by_category = defaultdict(float)
+    for t in transactions:
+        amt = float(t["amount"])
+        if amt >= 0:
+            total_income += amt
+        else:
+            total_expenses += abs(amt)
+            cat = t.get("category", t.get("tags", ["другое"])[0] if t.get("tags") else "другое")
+            totals_by_category[cat] += abs(amt)
+    stats = {
+        "income": round(total_income, 2),
+        "expenses": round(total_expenses, 2),
+        "balance": round(total_income - total_expenses, 2),
+        "transactions_count": len(transactions),
+        "totals_by_category": dict(totals_by_category)
+    }
+    return stats
+
+
+def calculate_financial_health_score(transactions: list) -> dict:
+    """
+    Простейшая метрика "здоровья":
+    - savings_rate = сбережения / доходы (если доходы > 0)
+    - eating_out_ratio = доля трат по тегу food / расходов
+    - cash_flow_per_week
+    - health_score: 0..100 на основе простых правил
+    """
+    stats = calculate_basic_stats(transactions)
+    income = stats["income"]
+    expenses = stats["expenses"]
+    savings = max(0.0, income - expenses)
+    savings_rate = (savings / income) if income > 0 else 0.0
+
+    # eating_out_ratio: ищем теги "food" или category "еда"
+    food_spend = 0.0
+    for t in transactions:
+        desc = t.get("description_norm", "")
+        if "пицца" in desc or "ресторан" in desc or "кафе" in desc or "доставка" in desc or "пятерочка" in desc or t.get("category") == "еда":
+            if t["amount"] < 0:
+                food_spend += abs(t["amount"])
+    eating_out_ratio = (food_spend / expenses) if expenses > 0 else 0.0
+
+    # cash flow per week (приблизительно)
+    dates = []
+    for t in transactions:
+        try:
+            dates.append(datetime.strptime(t["date"], "%Y-%m-%d"))
+        except Exception:
+            pass
+    if dates:
+        span_days = (max(dates) - min(dates)).days or 1
+        weeks = max(1, span_days / 7)
+        cash_flow_week = (income - expenses) / weeks
+    else:
+        cash_flow_week = 0.0
+
+    # health score: простая шкала: базовые правила
+    score = 50
+    if savings_rate > 0.2:
+        score += 20
+    elif savings_rate > 0.1:
+        score += 10
+    else:
+        score -= 10
+
+    if eating_out_ratio > 0.3:
+        score -= 10
+    else:
+        score += 5
+
+    if cash_flow_week > 0:
+        score += min(15, int(cash_flow_week / 1000))
+    else:
+        score -= 10
+
+    score = max(0, min(100, score))
+
+    return {
+        "income": income,
+        "expenses": expenses,
+        "savings": round(savings, 2),
+        "savings_rate": round(savings_rate, 3),
+        "eating_out_ratio": round(eating_out_ratio, 3),
+        "cash_flow_per_week": round(cash_flow_week, 2),
+        "health_score": score
+    }
+
+
+def predict_future_spending(transactions: list, days: int = 30) -> dict:
+    """
+    Прогноз расходов на ближайшие N дней по простому скользящему среднему.
+    Возвращает словарь { "predicted_total": ..., "daily": ... }
+    """
+    # берём исторические расходов по дате
+    day_totals = defaultdict(float)
+    for t in transactions:
+        try:
+            d = datetime.strptime(t["date"], "%Y-%m-%d").date()
+        except Exception:
+            continue
+        if t["amount"] < 0:
+            day_totals[d] += abs(t["amount"])
+
+    if not day_totals:
+        return {"predicted_total": 0.0, "daily": [0.0] * days}
+
+    # сортируем по дате и берем среднее за последние 30/60 дней
+    amounts = list(day_totals.values())
+    avg_daily = mean(amounts)
+    predicted_daily = [round(avg_daily, 2)] * days
+    predicted_total = round(avg_daily * days, 2)
+    return {"predicted_total": predicted_total, "daily": predicted_daily}
+
+
+def detect_spending_anomalies(transactions: list) -> list:
+    """
+    Находит аномальные траты: любые расходы, которые существенно больше среднего по категории
+    (используем среднее и стандартное отклонение по суммам транзакций).
+    """
+    amounts = [abs(t["amount"]) for t in transactions if t["amount"] < 0]
+    if len(amounts) < 2:
+        return []
+
+    avg = mean(amounts)
+    try:
+        sd = stdev(amounts)
+    except Exception:
+        sd = 0.0
+
+    threshold = avg + 3 * sd
+    anomalies = []
+    for t in transactions:
+        if t["amount"] < 0 and abs(t["amount"]) > threshold:
+            anomalies.append({
+                "date": t["date"],
+                "amount": abs(t["amount"]),
+                "description": t.get("description", ""),
+            })
+    return anomalies
+
+
+# ---------------------------
+# Задача 4.4: Симулятор финансовых решений
+# ---------------------------
+
+def simulate_financial_decisions(budget: dict, scenarios: list, months: int = 12) -> dict:
+    """
+    Применяет сценарии (список словарей с "impact") и моделирует последствия на budget и накопления.
+    Формат scenario: {"action": str, "impact": {"transport": +15000, "savings": -500000, "income": +20000}}
+    - positive numbers for recurring monthly increases (например transport:+15000 значит расходы в transport увеличатся на 15000/мес)
+    - special keys: "savings" / "income" can be lump-sum (negative for decrease) or positive
+    Возвращает результаты: для каждого сценария — прогноз по накоплениям/времени достижения целей и изменённый бюджет.
+    """
+    results = []
+    base_budget = copy.deepcopy(budget)
+
+    # helper to sum monthly budgeted expenses (excluding "накопления")
+    def monthly_expense_from_budget(b):
+        return sum(info["limit"] for k, info in b.items() if k != "накопления")
+
+    base_monthly_exp = monthly_expense_from_budget(base_budget)
+    base_savings_limit = base_budget.get("накопления", {}).get("limit", 0)
+
+    for scen in scenarios:
+        s = copy.deepcopy(scen)
+        action = s.get("action", "action")
+        impact = s.get("impact", {})
+        b_new = copy.deepcopy(base_budget)
+
+        # Apply monthly impacts to categories
+        for k, v in impact.items():
+            if k == "income":
+                # increase monthly income — reflect by increasing "накопления" capacity proportionally
+                # Here we treat income impact as monthly recurring
+                b_new.setdefault("накопления", {"limit": base_savings_limit})
+                b_new["накопления"]["limit"] = round(b_new["накопления"]["limit"] + v * 0.5, 2)
+            elif k == "savings":
+                # lump-sum decrease/increase in savings -> reduce/add recommended savings (one-time)
+                b_new.setdefault("накопления", {"limit": base_savings_limit, "recommended": base_savings_limit})
+                b_new["накопления"]["limit"] = round(max(0, b_new["накопления"]["limit"] + v), 2)
+            else:
+                # category impact: treat as monthly change in expenses (positive means more expense)
+                if k in b_new:
+                    b_new[k]["limit"] = round(max(0, b_new[k]["limit"] + v), 2)
+                else:
+                    # if category absent — create it
+                    b_new[k] = {"limit": round(max(0, v), 2), "recommended": round(max(0, v), 2)}
+
+        # Simulate months: compute cumulative savings if user follows new budget limits
+        monthly_income = s.get("monthly_income_override")  # optional override
+        # approximate income from budget: income = expenses + savings_target + cashflow? We cannot derive income reliably.
+        # For simulation we compute delta between base monthly expense and new one and see effect on savings limit.
+        new_monthly_exp = monthly_expense_from_budget(b_new)
+        monthly_savings_target = b_new.get("накопления", {}).get("limit", base_savings_limit)
+        # naive projection: monthly_free = (previously saved) + (old_exp - new_exp)
+        # assume user maintains same income; savings change = old_monthly_exp - new_monthly_exp (if new_exp less)
+        delta_monthly = round(base_monthly_exp - new_monthly_exp, 2)
+        # cumulative savings over months
+        cumulative_savings = []
+        curr = b_new.get("накопления", {}).get("recommended", monthly_savings_target)
+        # start from 0 extra
+        extra = 0.0
+        for m in range(months):
+            extra += delta_monthly
+            cumulative_savings.append(round(extra, 2))
+
+        results.append({
+            "action": action,
+            "modified_budget": b_new,
+            "delta_monthly": delta_monthly,
+            "cumulative_savings_12m": cumulative_savings,
+        })
+
+    return {"base_budget": base_budget, "scenarios": results}
+
+
+# ---------------------------
+# Задача 4.5: Система финансовых целей
+# ---------------------------
+
+def track_financial_goals(budget: dict, goals: list) -> dict:
+    """
+    goals: список словарей: {"name":..., "target":int, "current":int, "deadline":"YYYY-MM-DD", "priority":1}
+    Возвращает прогресс, % и статус (on track / behind).
+    Для оценки "on track" мы сравниваем требуемую ежемесячную сумму с текущими возможными накоплениями (budget["накопления"]["limit"])
+    """
+    results = []
+    savings_monthly_capacity = budget.get("накопления", {}).get("limit", 0.0)
+    today = datetime.today().date()
+    for g in goals:
+        name = g["name"]
+        target = float(g["target"])
+        current = float(g.get("current", 0.0))
+        deadline_str = g.get("deadline")
+        try:
+            deadline = datetime.strptime(deadline_str, "%Y-%m-%d").date()
+            months_left = max(0.0, (deadline - today).days / 30.0)
+        except Exception:
+            months_left = None
+
+        remaining = max(0.0, target - current)
+        percent = round((current / target) * 100, 1) if target > 0 else 0.0
+
+        if months_left and months_left > 0:
+            required_per_month = round(remaining / months_left, 2)
+            if savings_monthly_capacity >= required_per_month:
+                status = "по плану"
+            else:
+                # estimate delay in months if only using savings_monthly_capacity
+                if savings_monthly_capacity > 0:
+                    months_needed = math.ceil(remaining / savings_monthly_capacity)
+                    status = f"отстаете, нужно ~{months_needed} мес."
+                else:
+                    status = "отстаете (нет месячных средств)"
+        else:
+            required_per_month = None
+            status = "срок неизвестен"
+
+        results.append({
+            "name": name,
+            "target": target,
+            "current": current,
+            "percent": percent,
+            "deadline": deadline_str,
+            "required_per_month": required_per_month,
+            "status": status
+        })
+
+    return {"monthly_capacity": savings_monthly_capacity, "goals": results}
+
+
+# ---------------------------
+# Задача 4.6: Персонализированные рекомендации
+# ---------------------------
+
+def generate_personalized_advice(analysis: dict, user_profile: dict = None) -> list:
+    """
+    Генерирует советы на основе вычисленных метрик (analysis — результат calculate_financial_health_score).
+    user_profile: может содержать приоритеты, возраст/семью и т.п. (учитывается упрощенно)
+    """
+    advice = []
+    if not analysis:
+        return advice
+
+    if analysis.get("eating_out_ratio", 0) > 0.3:
+        advice.append("Слишком много тратите на еду вне дома. Попробуйте готовить дома 3 раза в неделю.")
+    if analysis.get("savings_rate", 0) < 0.1:
+        advice.append("Рекомендуем откладывать минимум 10% от дохода — автоматизируйте перевод на сберсчёт.")
+    if analysis.get("cash_flow_per_week", 0) < 0:
+        advice.append("Положите часть зарплаты на еженедельный резерв — 1-2% дохода.")
+    # профильные подсказки
+    if user_profile:
+        if user_profile.get("has_children"):
+            advice.append("Увеличьте резерв на непредвиденные расходы (3-6 месяцев).")
+        if user_profile.get("age") and user_profile["age"] > 50:
+            advice.append("Подумайте об увеличении консервативных накоплений и снижении рисков.")
+    # практичные советы
+    advice.append("Рассмотрите кэшбек-карту для регулярных покупок (супермаркеты, заправки).")
+    return advice
+
+
+# ---------------------------
+# Задача 4.7: Оптимизатор бюджета
+# ---------------------------
+
+def optimize_budget_allocation(current_budget: dict, goals: list, user_priorities: dict = None) -> dict:
+    """
+    Предлагает перераспределение бюджета на основе метода 50/30/20 как отправной точки,
+    но учитывает приоритеты целей (priority: 1..N, 1 — highest).
+    current_budget: словарь категории -> {"limit":.., "recommended":..}
+    goals: список целей, каждая может иметь поле priority (чем меньше — выше приоритет)
+    user_priorities: дополнительные веса категорий
+    Возвращает новый распределённый бюджет (включая накопления).
+    """
+    # Считаем текущие суммы
+    total_expenses = sum(info["limit"] for k, info in current_budget.items() if k != "накопления")
+    current_savings = current_budget.get("накопления", {}).get("limit", 0.0)
+    total_income_est = total_expenses + current_savings  # приблизительная оценка дохода
+
+    # целевые пропорции
+    need_share = 0.5
+    want_share = 0.3
+    save_share = 0.2
+
+    # если есть приоритеты — перенаправляем часть "want" в "save" или в нужды
+    goal_priority_weight = 0.0
+    for g in goals:
+        if g.get("priority") and g["priority"] <= 2:
+            goal_priority_weight += 0.05  # небольшая корректировка на каждую важную цель
+
+    # итоговые доли с учётом приоритетов (нормируем)
+    save_share = min(0.6, save_share + goal_priority_weight)
+    want_share = max(0.05, 1.0 - (need_share + save_share))
+    # бюджетируем по сумме дохода (оценочной)
+    new_savings_target = round(total_income_est * save_share, 2)
+    need_budget = round(total_income_est * need_share, 2)
+    want_budget = round(total_income_est * want_share, 2)
+
+    # Распределяем need_budget сначала по текущим 'essential' категориям (например housing, food, transport, utilities)
+    essentials = ["housing", "еда", "transport", "utilities", "health"]
+    new_budget = {}
+    # extract current category shares
+    current_categories = {k: v["limit"] for k, v in current_budget.items() if k != "накопления"}
+    total_current = sum(current_categories.values()) or 1.0
+    # Pro-rate the need_budget according to current shares but prioritize essentials
+    essentials_sum = sum(current_categories.get(k, 0.0) for k in essentials)
+    if essentials_sum == 0:
+        essentials_sum = total_current  # fallback
+
+    for cat, cur_val in current_categories.items():
+        weight = cur_val / total_current
+        # if cat in essentials -> extra weight
+        if cat in essentials:
+            weight *= 1.2
+        # assign from need+want proportionally
+        new_val = round((need_budget + want_budget) * weight, 2)
+        new_budget[cat] = {"limit": new_val, "recommended": round(cur_val, 2)}
+
+    # set savings
+    new_budget["накопления"] = {"limit": new_savings_target, "recommended": new_savings_target}
+    return {"estimated_income": round(total_income_est, 2), "new_budget": new_budget}
+
+
+# ---------------------------
+# Визуализации (matplotlib)
+# ---------------------------
+
+def visualize_goals_progress(goals_report: dict, save_path: str = None):
+    """
+    Отображает прогресс целей (горизонтальные бары) и помечает статус.
+    """
+    goals = goals_report["goals"]
+    names = [g["name"] for g in goals]
+    percents = [g["percent"] for g in goals]
+    statuses = [g["status"] for g in goals]
+
+    fig, ax = plt.subplots(figsize=(8, max(3, len(goals)*0.6)))
+    bars = ax.barh(names, percents)
+    ax.set_xlim(0, 100)
+    ax.set_xlabel("Процент выполнения (%)")
+    ax.set_title("Прогресс финансовых целей")
+
+    for i, (bar, st) in enumerate(zip(bars, statuses)):
+        w = bar.get_width()
+        ax.text(w + 1, bar.get_y() + bar.get_height()/2, st, va='center', fontsize=9)
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path)
+    plt.show()
+
+
+def visualize_simulation_results(simulation: dict, months: int = 12, save_path: str = None):
+    """
+    По результатам simulate_financial_decisions строит график накоплений по сценарию.
+    """
+    scenarios = simulation["scenarios"]
+    fig, ax = plt.subplots(figsize=(9, 5))
+    x = list(range(1, months+1))
+    for s in scenarios:
+        ax.plot(x, s["cumulative_savings_12m"], label=s["action"], marker='o')
+    ax.set_xlabel("Месяцы")
+    ax.set_ylabel("Кумулятивная экономия (условная, руб.)")
+    ax.set_title("Эффект сценариев на кумулятивную экономию")
+    ax.legend()
+    ax.grid(axis="y", linestyle="--", alpha=0.6)
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path)
+    plt.show()
+
+
+def visualize_budget_report(budget_report: dict):
+    """
+    Рисует бюджет vs фактические расходы (как ранее).
+    Ожидается формат budget_report: {category: {"limit":.., "actual":.., ...}}
+    """
+    categories = [c for c in budget_report.keys() if c != "накопления"]
+    actuals = [budget_report[c]["actual"] for c in categories]
+    limits = [budget_report[c]["limit"] for c in categories]
+
+    # bar actuals
+    plt.figure(figsize=(8, 5))
+    plt.bar(categories, actuals)
+    plt.title("Фактические расходы по категориям")
+    plt.xticks(rotation=30)
+    plt.tight_layout()
+    plt.show()
+
+    # budget vs actual
+    plt.figure(figsize=(8, 5))
+    x = range(len(categories))
+    plt.bar([i - 0.2 for i in x], limits, width=0.4, label="Лимит")
+    plt.bar([i + 0.2 for i in x], actuals, width=0.4, label="Факт")
+    plt.xticks(x, categories, rotation=30)
+    plt.legend()
+    plt.title("Бюджет vs Факт")
+    plt.tight_layout()
+    plt.show()
+
+
+# ---------------------------
+# Печать комплексного отчёта
+# ---------------------------
+
+def print_comprehensive_report(stats, health_score, predictions, anomalies, goals_report, advice, optimized):
+    print("\n=== СУПЕР-ОТЧЁТ ===\n")
+    print("Основные показатели:")
+    print(f"• Доходы: {stats['income']} руб.")
+    print(f"• Расходы: {stats['expenses']} руб.")
+    print(f"• Баланс: {stats['balance']} руб.")
+    print(f"• Транзакций: {stats['transactions_count']}")
+
+    print("\nФинансовое здоровье:")
+    print(f"• Health score: {health_score['health_score']} / 100")
+    print(f"• Savings rate: {health_score['savings_rate']*100:.1f}%")
+    print(f"• Eating out ratio: {health_score['eating_out_ratio']*100:.1f}%")
+    print(f"• Cash flow per week: {health_score['cash_flow_per_week']} руб./нед")
+
+    print("\nПрогноз на ближайшие дни:")
+    print(f"• Ожидаемые расходы за {len(predictions['daily'])} дней: {predictions['predicted_total']} руб.")
+
+    print("\nАномалии:")
+    if anomalies:
+        for a in anomalies:
+            print(f"• {a['date']}: {a['amount']} руб. — {a['description']}")
+    else:
+        print("• Не обнаружено")
+
+    print("\nЦели:")
+    for g in goals_report["goals"]:
+        print(f"• {g['name']}: {g['current']}/{g['target']} ({g['percent']}%) — {g['status']} (deadline: {g['deadline']})")
+
+    print("\nПерсональные советы:")
+    for i, s in enumerate(advice, 1):
+        print(f"{i}. {s}")
+
+    print("\nОптимизированный бюджет (кратко):")
+    print(f"Оценочный доход: {optimized['estimated_income']}")
+    for cat, info in optimized["new_budget"].items():
+        print(f"• {cat}: лимит {info['limit']} (рекомендовано {info['recommended']})")
+    print("\n--- КОНЕЦ ОТЧЁТА ---\n")
+
+
+# ---------------------------
+# main_enhanced — orchestration
+# ---------------------------
+
+def main_enhanced():
+    # 1. Расширенный импорт (в реальной системе замените на import_financial_data)
+    transactions = [
+        {"date": "2024-01-15", "amount": -1500.50, "description": "Продукты в Пятерочке", "type": "расход", "category": "еда"},
+        {"date": "2024-01-10", "amount": 50000.00, "description": "Зарплата", "type": "доход", "category": "доход"},
+        {"date": "2024-01-08", "amount": -350, "description": "Метро", "type": "расход", "category": "transport"},
+        {"date": "2024-01-05", "amount": -1200, "description": "Ресторан Суши", "type": "расход", "category": "еда"},
+        {"date": "2024-01-03", "amount": -450, "description": "Аптека", "type": "расход", "category": "health"},
+        {"date": "2024-02-10", "amount": -15000, "description": "Электронный мир — телевизор", "type": "расход", "category": "electronics"},
+        {"date": "2024-02-01", "amount": -600, "description": "Netflix подписка", "type": "расход", "category": "subscription"},
+        {"date": "2024-03-01", "amount": -600, "description": "Netflix подписка", "type": "расход", "category": "subscription"},
+        {"date": "2024-04-01", "amount": -600, "description": "Netflix подписка", "type": "расход", "category": "subscription"},
+    ]
+
+    transactions = smart_description_parser(transactions)
+    transactions = detect_and_convert_currency(transactions)
+    duplicates = find_duplicate_transactions(transactions)
+    transactions = add_tags_to_transactions(transactions)
+    recurring = identify_recurring_payments(transactions)
+
+    # 2. Умная классификация — предполагаем, что роль 2 уже добавила 'category'; если нет, можно вызвать categorize_all_transactions
+    # (здесь пропускаем, поскольку в примере категории есть)
+
+    # 3. Глубокий анализ
+    stats = calculate_basic_stats(transactions)
+    health_score = calculate_financial_health_score(transactions)
+    predictions = predict_future_spending(transactions, 30)
+    anomalies = detect_spending_anomalies(transactions)
+
+    # 4. Персональное планирование
+    # Создадим шаблон бюджета на основе avg (упрощённо возьмем средние)
+    # Используем нашу функцию create_budget_template, но она ожидает "analysis" — создадим простую форму
+    avg_spending = {}
+    # возьмём суммарные по категории и усредним на 1 месяц (упрощение)
+    for cat, total in stats["totals_by_category"].items():
+        avg_spending[cat] = total  # считать как месячный
+    analysis_like = {"average_spending": avg_spending, "top_categories": sorted(avg_spending, key=avg_spending.get, reverse=True)}
+    budget = create_budget_template(analysis_like, total_income=stats["income"])
+
+    # Пример целей пользователя
+    user_goals = [
+        {"name": "отпуск", "target": 100000, "current": 45000, "deadline": "2024-07-01", "priority": 1},
+        {"name": "новый ноутбук", "target": 80000, "current": 15000, "deadline": "2024-03-01", "priority": 2}
+    ]
+    goals_report = track_financial_goals(budget, user_goals)
+    user_profile = {"age": 30, "has_children": False}
+    advice = generate_personalized_advice(health_score, user_profile)
+    optimized = optimize_budget_allocation(budget, user_goals)
+
+    # Симуляция решений
+    scenarios = [
+        {"action": "купить машину", "impact": {"transport": 15000, "savings": -500000}},
+        {"action": "сменить работу ( +20k )", "impact": {"income": 20000}},
+        {"action": "взять ипотеку", "impact": {"housing": 25000, "savings": -2000000}}
+    ]
+    simulation = simulate_financial_decisions(budget, scenarios, months=12)
+
+    # Выводим отчёт
+    print_comprehensive_report(stats, health_score, predictions, anomalies, goals_report, advice, optimized)
+
+    # Визуализации
+    visualize_goals_progress(goals_report)
+    visualize_simulation_results(simulation, months=12)
+    # Для визуализации бюджета нам нужно сначала сравнить фактические транзакции и бюджет
+    comparison = compare_budget_vs_actual(budget, transactions)
+    visualize_budget_report(comparison["budget_report"])
+
+
+# ---------------------------
+# Интеграция: используем ранее реализованные функции create_budget_template и compare_budget_vs_actual
+# (из твоего базового модуля — если он уже загружен, то можно использовать общий код)
+# ---------------------------
+
+def create_budget_template(analysis: dict, total_income: float = None) -> dict:
+    """
+    Реализация из базовой версии — добавлена сюда повторно для целостности модуля.
+    """
+    avg_spending = analysis.get("average_spending", {})
+    if not avg_spending:
+        return {}
+
+    total_expenses = sum(avg_spending.values())
+    if total_income and total_income > total_expenses:
+        savings_target = round((total_income - total_expenses) * 0.5, 2)
+    else:
+        savings_target = round(total_expenses * 0.1, 2)
+
+    budget = {}
+    for category, avg_amount in avg_spending.items():
+        limit = round(avg_amount * 1.1, 2)
+        budget[category] = {"limit": limit, "recommended": avg_amount}
+
+    budget["накопления"] = {"limit": savings_target, "recommended": savings_target}
+    return budget
+
+
+def compare_budget_vs_actual(budget: dict, actual_transactions: list) -> dict:
+    """
+    Реализация сравнения бюджета и факта (копия из базовой версии).
+    """
+    actual_spending = defaultdict(float)
+    for t in actual_transactions:
+        if t["amount"] < 0:
+            cat = t.get("category", t.get("tags", ["другое"])[0] if t.get("tags") else "другое")
+            actual_spending[cat] += abs(t["amount"])
+
+    report = {}
+    total_overspent = 0.0
+
+    for category, info in budget.items():
+        limit = info["limit"]
+        actual = actual_spending.get(category, 0.0)
+        diff = round(limit - actual, 2)
+        status = "✅ В пределах бюджета" if diff >= 0 else "⚠️ Превышение бюджета"
+        if diff < 0:
+            total_overspent += abs(diff)
+        report[category] = {
+            "limit": limit,
+            "actual": round(actual, 2),
+            "difference": diff,
+            "status": status
+        }
+
+    recommendations = []
+    if total_overspent > 0:
+        recommendations.append(f"Вы превысили бюджет на {total_overspent:.2f} руб. Попробуйте скорректировать траты.")
+    else:
+        recommendations.append("Отлично! Вы укладываетесь в бюджет 🎉")
+
+    return {"budget_report": report, "recommendations": recommendations}
+
+
+# ---------------------------
+# Если этот файл запускается как скрипт — выполняем main_enhanced()
+# ---------------------------
+
+if __name__ == "__main__":
+    main_enhanced()
