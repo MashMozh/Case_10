@@ -1,0 +1,97 @@
+import statistics
+from collections import defaultdict
+
+def analyze_historical_spending(transactions: list) -> dict:
+    """
+    Анализирует исторические траты:
+    - Средние траты по категориям в месяц
+    - Определяет категории с наибольшими расходами
+    """
+
+    # Группируем по категориям и месяцам
+    monthly_spending = defaultdict(lambda: defaultdict(float))
+
+    for t in transactions:
+        if t["amount"] < 0:  # только расходы
+            date_obj = datetime.datetime.strptime(t["date"], "%Y-%m-%d")
+            month = date_obj.strftime("%Y-%m")
+            category = t.get("category", "Без категории")
+            monthly_spending[category][month] += abs(t["amount"])
+
+    # Средние траты по категориям
+    avg_spending = {}
+    for category, months in monthly_spending.items():
+        values = list(months.values())
+        avg_spending[category] = round(statistics.mean(values), 2) if values else 0
+
+    # Определяем топ категорий по расходам
+    top_categories = sorted(avg_spending.items(), key=lambda x: x[1], reverse=True)[:3]
+
+    analysis = {
+        "average_spending": avg_spending,
+        "top_categories": top_categories
+    }
+
+    return analysis
+
+
+def create_budget_template(analysis: dict, total_income: float = None) -> dict:
+    """
+    Создает шаблон бюджета на основе анализа.
+    Устанавливает лимиты по категориям и выделяет накопления.
+    """
+
+    avg_spending = analysis.get("average_spending", {})
+    top_cats = analysis.get("top_categories", [])
+
+    if not avg_spending:
+        return {}
+
+    # Базовый бюджет = средние траты + резерв на накопления
+    budget = {}
+    total_expenses = sum(avg_spending.values())
+
+    # Если известен доход — оставим 10-20% на накопления
+    if total_income:
+        savings = round(total_income * 0.15, 2)
+    else:
+        savings = round(total_expenses * 0.1, 2)
+
+    for category, avg_value in avg_spending.items():
+        budget[category] = {
+            "limit": round(avg_value * 1.05, 2),  # небольшой запас
+            "recommended": round(avg_value, 2)
+        }
+
+    budget["накопления"] = {"limit": savings, "recommended": savings}
+
+    return budget
+
+
+def compare_budget_vs_actual(budget: dict, actual_transactions: list) -> dict:
+    """
+    Сравнивает запланированные лимиты с фактическими расходами.
+    Возвращает отчет по категориям.
+    """
+
+    # Считаем фактические расходы по категориям
+    actual_spending = defaultdict(float)
+    for t in actual_transactions:
+        if t["amount"] < 0:
+            actual_spending[t.get("category", "Без категории")] += abs(t["amount"])
+
+    report = {}
+    for category, data in budget.items():
+        limit = data.get("limit", 0)
+        actual = actual_spending.get(category, 0)
+        diff = limit - actual
+        status = "✅ В пределах бюджета" if diff >= 0 else "⚠️ Превышен бюджет"
+
+        report[category] = {
+            "limit": limit,
+            "actual": actual,
+            "difference": diff,
+            "status": status
+        }
+
+    return report
